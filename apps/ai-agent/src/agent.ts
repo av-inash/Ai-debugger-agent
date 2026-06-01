@@ -11,6 +11,43 @@ const git = simpleGit(); // GitOps Controller
 // 1. Load environment variables
 dotenv.config();
 
+// --- DISCORD WEBHOOK SETUP ---
+const DISCORD_WEBHOOK_URL =process.env.DISCORD_WEBHOOK_URL;
+
+
+
+async function sendDiscordAlert(serviceName: string, errorMessage: string, rca: string, branchName: string) {
+    try {
+        const payload = {
+            username: "AI SRE Agent",
+            avatar_url: "https://cdn-icons-png.flaticon.com/512/4712/4712035.png", // Robot icon
+            embeds: [
+                {
+                    title: `🚨 System Auto-Healed: ${serviceName}`,
+                    color: 16711680, // Red color for alerts
+                    description: "An exception was detected in production. The AI Agent has analyzed the issue, generated a fix, and raised a PR.",
+                    fields: [
+                        { name: "🔴 Error Message", value: `\`${errorMessage}\``, inline: false },
+                        { name: "🧠 Root Cause Analysis", value: rca.substring(0, 1000), inline: false }, // Truncated to avoid Discord limits
+                        { name: "🌿 Git Branch (PR Ready)", value: `\`${branchName}\``, inline: false }
+                    ],
+                    footer: { text: "Event-Driven AI Observability Pipeline" },
+                    timestamp: new Date().toISOString()
+                }
+            ]
+        };
+
+        await fetch(DISCORD_WEBHOOK_URL as string, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        console.log("📲 [DISCORD] Alert successfully pushed to channel!");
+    } catch (error) {
+        console.error("❌ [DISCORD] Failed to send alert:", error);
+    }
+}
+
 // (Baki saare imports waise hi rahenge)
 
 // --- MCP CONCEPT: Local File System Access Helper ---
@@ -186,6 +223,7 @@ const startAgent = async () => {
                                 
                                 // Agent ko wapas main branch pe laana (taaki dev environment disturb na ho)
                                 await git.checkout('main'); 
+                                await sendDiscordAlert(errorEvent.serviceName, errorEvent.errorDetails.message, rcaText, branchName);
 
                             } catch (gitError) {
                                 console.error("❌ [GITOPS] Failed to apply git commit:", gitError);
