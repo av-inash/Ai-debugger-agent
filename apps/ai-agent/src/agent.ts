@@ -1,0 +1,230 @@
+
+import { Kafka } from 'kafkajs';
+import { IKafkaErrorEvent } from '@ai-debugger/shared-types';
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { Pinecone } from '@pinecone-database/pinecone';
+import fs from 'fs';
+import * as dotenv from 'dotenv';
+import { simpleGit } from 'simple-git';
+const git = simpleGit(); // GitOps Controller
+
+// 1. Load environment variables
+dotenv.config();
+
+// (Baki saare imports waise hi rahenge)
+
+// --- MCP CONCEPT: Local File System Access Helper ---
+function extractCodeContext(stackTrace: string) {
+    // Regex to find file path and line number in the stack trace
+    // Example: /Users/.../apps/order-service/src/server.ts:23
+    const match = stackTrace.match(/(\/.*?\.ts):(\d+)/);
+    
+    if (match) {
+        const filePath = match[1];
+        const errorLine = parseInt(match[2], 10);
+        try {
+            console.log(`📂 [MCP] Reading local file: ${filePath}`);
+            const fileContent = fs.readFileSync(filePath, 'utf-8');
+            const lines = fileContent.split('\n');
+            
+            // Error wali line ke 5 line upar aur 5 line neeche ka code uthao
+            const start = Math.max(0, errorLine - 6);
+            const end = Math.min(lines.length, errorLine + 5);
+            
+            const codeSnippet = lines.slice(start, end).map((line, idx) => `${start + idx + 1}: ${line}`).join('\n');
+            return { filePath, codeSnippet, errorLine };
+        } catch (e) {
+            console.log("⚠️ [MCP] Could not read local file for context.");
+            return null;
+        }
+    }
+    return null;
+}
+const apiKey = process.env.GEMINI_API_KEY;
+const pineconeApiKey = process.env.PINECONE_API_KEY;
+
+if (!apiKey || !pineconeApiKey) {
+  throw new Error("Missing GEMINI_API_KEY or PINECONE_API_KEY in .env");
+}
+
+// 2. Initialize Gemini (Text & Embedding Models)
+const genAI = new GoogleGenerativeAI(apiKey);
+
+// For generating RCA
+const aiModel = genAI.getGenerativeModel({
+    model: "gemini-3-flash-preview", // Yahan apna 'gemini-3-flash-preview' rakh sakte ho
+    generationConfig: { maxOutputTokens: 3048, temperature: 0.1 },
+});
+
+// For converting text to Vectors (Industry standard is text-embedding-004)
+const embeddingModel = genAI.getGenerativeModel({ model: "embedding-001" });
+
+// 3. Initialize Pinecone Vector DB
+const pc = new Pinecone({ apiKey: pineconeApiKey });
+const index = pc.index(process.env.PINECONE_INDEX || 'ai-debugger-memory');
+
+// 4. Kafka Setup
+const kafka = new Kafka({ clientId: 'ai-debugger-agent', brokers: ['localhost:9092'] });
+const consumer = kafka.consumer({ groupId: 'ai-debugger-group' });
+
+// Helper: Text ko Embeddings (768 dimensions) me convert karna
+// async function getEmbedding(text: string) {
+//     const result = await embeddingModel.embedContent(text);
+//     return result.embedding.values;
+// }
+// Helper: Text ko Embeddings (768 dimensions) me convert karna
+async function getEmbedding(text: string) {
+    try {
+        // Attempt 1: Try Google's standard embedding model
+        const result = await embeddingModel.embedContent(text);
+        return result.embedding.values;
+    } catch (apiError) {
+        console.log("⚠️ Google Embedding API failed. Activating Local Fallback Vector...");
+        
+        // Attempt 2 (The Architect Hack): Agar Google API fail ho jaye, 
+        // toh text ke characters se khud ek 768-dimension ka deterministic array bana lo.
+        // Isse same error aane par hamesha exactly same vector banega aur Pinecone match kar lega!
+        const vector = new Array(768).fill(0.01); 
+        for (let i = 0; i < text.length; i++) {
+            // Use char code to generate a unique but consistent mathematical number
+            vector[i % 768] = (text.charCodeAt(i) % 100) / 100;
+        }
+        return vector;
+    }
+}
+
+const startAgent = async () => {
+    try {
+        await consumer.connect();
+        console.log("🤖 [AI AGENT] Connected to Kafka Consumer");
+        await consumer.subscribe({ topic: 'global-error-stream', fromBeginning: false });
+        console.log("🎧 Listening for new microservice errors...\n");
+
+       await consumer.run({
+            eachMessage: async ({ topic, partition, message }) => {
+                if (!message.value) return;
+                
+                // 🛑 SAFETY NET: Try-catch block to prevent Kafka infinite loops
+                try {
+                    const errorEvent: IKafkaErrorEvent = JSON.parse(message.value.toString());
+                    console.log(`\n🚨 [NEW INCIDENT DETECTED] : ${errorEvent.serviceName}`);
+                    console.log(`📝 Message: ${errorEvent.errorDetails.message}`);
+                    console.log("-------------------------------------------------");
+
+                    // STEP A: Vector Search (Retrieval)
+                    const errorSignature = `Error in ${errorEvent.serviceName}: ${errorEvent.errorDetails.message}`;
+                    console.log("🔍 Searching Pinecone Vector DB for historical context...");
+                    
+                    const vector = await getEmbedding(errorSignature);
+                    const queryResponse = await index.query({
+                        vector: vector,
+                        topK: 1, 
+                        includeMetadata: true
+                    });
+
+                    let historicalContext = "";
+                    if (queryResponse.matches.length > 0 && queryResponse.matches[0].score && queryResponse.matches[0].score > 0.8) {
+                        console.log("🟢 [MEMORY HIT] Similar past incident found!");
+                        historicalContext = `
+                        PAST SIMILAR INCIDENT:
+                        Error: ${queryResponse.matches[0].metadata?.errorMsg}
+                        Past Solution: ${queryResponse.matches[0].metadata?.rca}
+                        `;
+                    } else {
+                        console.log("🔴 [MEMORY MISS] No exact history found. Generating fresh RCA...");
+                    }
+
+                    // STEP B: Context-Aware Generation (Augment & Generate)
+                    console.log("🧠 Analyzing with Gemini AI...");
+                    // NAYA CODE: Stack trace se actual source code fetch karo
+                 const localCode = extractCodeContext(errorEvent.errorDetails.stack);
+                    const codeBlock = localCode ? `
+                    ACTUAL SOURCE CODE (${localCode.filePath}):
+                    \`\`\`typescript
+                    ${localCode.codeSnippet}
+                    \`\`\`
+                    ` : "Code context not available.";
+
+                    const prompt = `
+                    You are an Expert Site Reliability Engineer (SRE). 
+                    Analyze the following error details.
+
+                    CURRENT INCIDENT:
+                    Service Name: ${errorEvent.serviceName}
+                    Error Message: ${errorEvent.errorDetails.message}
+                    
+                    ${codeBlock}
+                    
+                    Format your response in plain text with two headings: 
+                    1. Root Cause
+                    2. Code Fix 
+                    CRITICAL: Under "Code Fix", provide the ENTIRE updated Typescript file content wrapped in \`\`\`typescript ... \`\`\`. Do not just provide a snippet. We need to overwrite the file autonomously.
+                    `;
+                    const result = await aiModel.generateContent(prompt);
+                    const rcaText = result.response.text();
+                    
+                    console.log("\n💡 [AI ROOT CAUSE ANALYSIS] 💡");
+                    console.log(rcaText);
+                    console.log("=================================================\n");
+
+                    if (localCode) {
+                        // Regex se AI ka likha hua exact naya code nikalna
+                        const codeMatch = rcaText.match(/```typescript\n([\s\S]*?)```/);
+                        
+                        if (codeMatch && codeMatch[1]) {
+                            const newFileContent = codeMatch[1];
+                            const branchName = `auto-fix/${errorEvent.serviceName}-${Date.now()}`;
+                            
+                            console.log(`\n🛠️ [GITOPS] Auto-Healing Initiated for ${localCode.filePath}...`);
+                            
+                            try {
+                                // 1. Overwrite the file with AI's fix
+                                fs.writeFileSync(localCode.filePath, newFileContent);
+                                console.log(`✏️ Source code successfully rewritten.`);
+
+                                // 2. Git Branch & Commit
+                                await git.checkoutLocalBranch(branchName);
+                                await git.add(localCode.filePath);
+                                await git.commit(`fix(${errorEvent.serviceName}): Auto-healed missing amount bug\n\nAI RCA: ${errorEvent.errorDetails.message}`);
+                                
+                                console.log(`🌿 Git branch '${branchName}' created & committed!`);
+                                console.log(`🚀 ACTION REQUIRED: Run 'git push origin ${branchName}' to open a Pull Request.\n`);
+                                
+                                // Agent ko wapas main branch pe laana (taaki dev environment disturb na ho)
+                                await git.checkout('main'); 
+
+                            } catch (gitError) {
+                                console.error("❌ [GITOPS] Failed to apply git commit:", gitError);
+                            }
+                        }
+                    }
+
+                    // STEP C: Save back to Vector DB
+                    console.log("💾 Memorizing this RCA to Vector Database...");
+                   await index.upsert({
+                        records: [
+                            {
+                                id: `evt_${Date.now()}`,
+                                values: vector,
+                                metadata: {
+                                    service: errorEvent.serviceName,
+                                    errorMsg: errorEvent.errorDetails.message,
+                                    rca: rcaText
+                                }
+                            }
+                        ]
+                    });
+                    console.log("✅ Incident successfully added to Long-Term Memory!");
+
+                } catch (err) {
+                    // Agar koi error aata hai (like API down), hum loop break kar denge
+                    console.error("⚠️ Skipping poison message to prevent infinite loop:", err);
+                }
+            },
+        });
+    } catch (error) {
+        console.error("Failed to start AI Agent:", error);
+    }
+};
+
+startAgent();
