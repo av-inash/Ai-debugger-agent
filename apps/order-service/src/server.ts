@@ -14,19 +14,33 @@ const kafka = new Kafka({
 });
 const producer = kafka.producer({ createPartitioner: Partitioners.LegacyPartitioner });
 
-// Ek dummy route jo error throw karega
+// Route to place an order with proper validation
 app.post('/api/v1/orders', async (req: Request, res: Response) => {
     try {
         const { item, amount } = req.body;
         
+        // Validation: Return 400 Bad Request for missing fields instead of throwing a 500 error
         if (!amount) {
-            throw new Error("Amount is required to place an order");
+            return res.status(400).json({ 
+                error: "Bad Request", 
+                message: "Amount is required to place an order" 
+            });
         }
 
-        // Logic goes here...
+        if (!item) {
+            return res.status(400).json({ 
+                error: "Bad Request", 
+                message: "Item name is required to place an order" 
+            });
+        }
+
+        // Business Logic goes here...
+        console.log(`Processing order for ${item} with amount ${amount}`);
+        
         res.status(201).json({ message: "Order placed successfully" });
 
     } catch (error: any) {
+        // This block now only handles genuine runtime/system failures
         const errorEvent: IKafkaErrorEvent = {
             eventId: `evt_${Date.now()}`,
             serviceName: 'order-service',
@@ -47,7 +61,7 @@ app.post('/api/v1/orders', async (req: Request, res: Response) => {
                     { value: JSON.stringify(errorEvent) }
                 ],
             });
-            console.log("✅ [SUCCESS] Error directly sent to Kafka Topic: global-error-stream");
+            console.log("✅ [SUCCESS] System error sent to Kafka Topic: global-error-stream");
         } catch (kafkaError) {
             console.error("❌ [KAFKA FAILED] Could not send message to Kafka", kafkaError);
         }
