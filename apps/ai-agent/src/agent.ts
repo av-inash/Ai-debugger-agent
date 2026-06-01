@@ -16,23 +16,17 @@ dotenv.config();
 // --- MCP CONCEPT: Local File System Access Helper ---
 function extractCodeContext(stackTrace: string) {
     // Regex to find file path and line number in the stack trace
-    // Example: /Users/.../apps/order-service/src/server.ts:23
     const match = stackTrace.match(/(\/.*?\.ts):(\d+)/);
     
     if (match) {
         const filePath = match[1];
         const errorLine = parseInt(match[2], 10);
         try {
-            console.log(`📂 [MCP] Reading local file: ${filePath}`);
-            const fileContent = fs.readFileSync(filePath, 'utf-8');
-            const lines = fileContent.split('\n');
+            console.log(`📂 [MCP] Reading FULL local file: ${filePath}`);
+            const fullFileContent = fs.readFileSync(filePath, 'utf-8');
             
-            // Error wali line ke 5 line upar aur 5 line neeche ka code uthao
-            const start = Math.max(0, errorLine - 6);
-            const end = Math.min(lines.length, errorLine + 5);
-            
-            const codeSnippet = lines.slice(start, end).map((line, idx) => `${start + idx + 1}: ${line}`).join('\n');
-            return { filePath, codeSnippet, errorLine };
+            // Ab hum poori file return kar rahe hain, sirf 11 lines nahi!
+            return { filePath, fullContent: fullFileContent, errorLine };
         } catch (e) {
             console.log("⚠️ [MCP] Could not read local file for context.");
             return null;
@@ -139,9 +133,9 @@ const startAgent = async () => {
                     // NAYA CODE: Stack trace se actual source code fetch karo
                  const localCode = extractCodeContext(errorEvent.errorDetails.stack);
                     const codeBlock = localCode ? `
-                    ACTUAL SOURCE CODE (${localCode.filePath}):
+                    ACTUAL FULL SOURCE CODE (${localCode.filePath}):
                     \`\`\`typescript
-                    ${localCode.codeSnippet}
+                    ${localCode.fullContent}
                     \`\`\`
                     ` : "Code context not available.";
 
