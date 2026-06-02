@@ -195,7 +195,7 @@ const startAgent = async () => {
                     const rcaText = result.response.text();
                     
                     console.log("\n💡 [AI ROOT CAUSE ANALYSIS] 💡");
-                    console.log(rcaText);
+                    // console.log(rcaText);
                     console.log("=================================================\n");
 
                     if (localCode) {
