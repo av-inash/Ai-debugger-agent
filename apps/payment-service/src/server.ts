@@ -4,7 +4,6 @@ import { IKafkaErrorEvent } from '@ai-debugger/shared-types';
 
 const app = express();
 app.use(express.json());
-
 const PORT = process.env.PORT || 3002;
 
 
@@ -17,8 +16,6 @@ const producer = kafka.producer({ createPartitioner: Partitioners.LegacyPartitio
 app.post('/api/v1/payments/process', async (req: Request, res: Response) => {
     try {
         const { orderId, paymentMethod } = req.body;
-        
-        
         
         console.log(`Processing payment for Order: ${orderId} using ${paymentMethod}`);
 
