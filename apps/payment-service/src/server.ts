@@ -16,13 +16,13 @@ const producer = kafka.producer({ createPartitioner: Partitioners.LegacyPartitio
 
 app.post('/api/v1/payments/process', async (req: Request, res: Response) => {
     try {
-        const { orderId, paymentMethod } = req.body;
+        const { orderId, paymentMethod, amount } = req.body;
         
-        // ✅ FIX: Removed the hardcoded Chaos Test error that was causing the service failure.
-        // In a real production environment, you would integrate with the Stripe SDK here.
-        // Example: const charge = await stripe.charges.create({...});
-        
-        console.log(`Processing payment for Order: ${orderId} using ${paymentMethod}`);
+        if (!amount) {
+            throw new Error("MissingAmountException: Cannot process payment without an amount. Please check the payload.");
+        }
+       
+        console.log(`Processing payment for Order: ${orderId} using ${paymentMethod} for amount: ${amount}`);
 
         // Simulate successful processing logic
         res.status(200).json({ 
@@ -71,3 +71,4 @@ const startServer = async () => {
 };
 
 startServer();
+
