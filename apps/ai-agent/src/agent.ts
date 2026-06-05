@@ -48,22 +48,88 @@ async function sendDiscordAlert(serviceName: string, errorMessage: string, rca: 
     }
 }
 
+
+async function createPullRequest(branchName: string, serviceName: string, errorMsg: string, rca: string) {
+    const githubToken = process.env.GITHUB_TOKEN;
+    const githubRepo = process.env.GITHUB_REPO; // format: "username/repository-name"
+
+    if (!githubToken || !githubRepo) {
+        console.log("⚠️ GITHUB_TOKEN or GITHUB_REPO missing. Skipping automatic PR creation.");
+        return;
+    }
+
+    try {
+        const response = await fetch(`https://api.github.com/repos/${githubRepo}/pulls`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `token ${githubToken}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                title: `🚨 AI Auto-Fix: Exception in ${serviceName}`,
+                body: `### AI Generated Fix\n**Error:** ${errorMsg}\n\n**RCA:**\n${rca}`,
+                head: branchName,
+                base: 'main' // Aapki default branch (main ya master)
+            })
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            console.log(`✅ [GITHUB] Pull Request created successfully: ${data.html_url}`);
+        } else {
+            const errorData = await response.json();
+            console.error("❌ [GITHUB] Failed to create PR:", errorData.message);
+        }
+    } catch (error) {
+        console.error("❌ [GITHUB] API Error:", error);
+    }
+}
+
 // (Baki saare imports waise hi rahenge)
 
 // --- MCP CONCEPT: Local File System Access Helper ---
+// function extractCodeContext(stackTrace: string) {
+//     // Regex to find file path and line number in the stack trace
+//     const match = stackTrace.match(/(\/.*?\.ts):(\d+)/);
+    
+//     if (match) {
+//         const filePath = match[1];
+//         const errorLine = parseInt(match[2], 10);
+//         try {
+//             console.log(`📂 [MCP] Reading FULL local file: ${filePath}`);
+//             const fullFileContent = fs.readFileSync(filePath, 'utf-8');
+            
+//             // Ab hum poori file return kar rahe hain, sirf 11 lines nahi!
+//             return { filePath, fullContent: fullFileContent, errorLine };
+//         } catch (e) {
+//             console.log("⚠️ [MCP] Could not read local file for context.");
+//             return null;
+//         }
+//     }
+//     return null;
+// }
+
 function extractCodeContext(stackTrace: string) {
-    // Regex to find file path and line number in the stack trace
     const match = stackTrace.match(/(\/.*?\.ts):(\d+)/);
     
     if (match) {
         const filePath = match[1];
         const errorLine = parseInt(match[2], 10);
         try {
-            console.log(`📂 [MCP] Reading FULL local file: ${filePath}`);
-            const fullFileContent = fs.readFileSync(filePath, 'utf-8');
+            console.log(`📂 [MCP] Reading local file: ${filePath}`);
+            const fullContent = fs.readFileSync(filePath, 'utf-8');
             
-            // Ab hum poori file return kar rahe hain, sirf 11 lines nahi!
-            return { filePath, fullContent: fullFileContent, errorLine };
+            // File ko lines mein break karo
+            const lines = fullContent.split('\n');
+            
+            // Error line se 15 line upar aur 15 line neeche ka data uthao (Total ~30 lines)
+            const startLine = Math.max(0, errorLine - 15);
+            const endLine = Math.min(lines.length, errorLine + 15);
+            
+            const snippet = lines.slice(startLine, endLine).join('\n');
+            
+            return { filePath, fullContent, snippet, errorLine };
         } catch (e) {
             console.log("⚠️ [MCP] Could not read local file for context.");
             return null;
@@ -71,6 +137,7 @@ function extractCodeContext(stackTrace: string) {
     }
     return null;
 }
+
 const apiKey = process.env.GEMINI_API_KEY;
 const pineconeApiKey = process.env.PINECONE_API_KEY;
 
@@ -166,70 +233,76 @@ const startAgent = async () => {
                     }
 
                     // STEP B: Context-Aware Generation (Augment & Generate)
-                    console.log("🧠 Analyzing with Gemini AI...");
-                    // NAYA CODE: Stack trace se actual source code fetch karo
-                 const localCode = extractCodeContext(errorEvent.errorDetails.stack);
-                    const codeBlock = localCode ? `
-                    ACTUAL FULL SOURCE CODE (${localCode.filePath}):
-                    \`\`\`typescript
-                    ${localCode.fullContent}
-                    \`\`\`
-                    ` : "Code context not available.";
+              console.log("🧠 Analyzing with Gemini AI...");
+const localCode = extractCodeContext(errorEvent.errorDetails.stack);
 
-                    const prompt = `
-                    You are an Expert Site Reliability Engineer (SRE). 
-                    Analyze the following error details.
+const codeBlock = localCode ? `
+ERROR LINE CONTEXT (30 lines around the error in ${localCode.filePath}):
+\`\`\`typescript
+${localCode.snippet}
+\`\`\`
+` : "Code context not available.";
 
-                    CURRENT INCIDENT:
-                    Service Name: ${errorEvent.serviceName}
-                    Error Message: ${errorEvent.errorDetails.message}
-                    
-                    ${codeBlock}
-                    
-                    Format your response in plain text with two headings: 
-                    1. Root Cause
-                    2. Code Fix 
-                    CRITICAL: Under "Code Fix", provide the ENTIRE updated Typescript file content wrapped in \`\`\`typescript ... \`\`\`. Do not just provide a snippet. We need to overwrite the file autonomously.
-                    `;
-                    const result = await aiModel.generateContent(prompt);
-                    const rcaText = result.response.text();
-                    
-                    console.log("\n💡 [AI ROOT CAUSE ANALYSIS] 💡");
-                    // console.log(rcaText);
-                    console.log("=================================================\n");
+const prompt = `
+You are an Expert Site Reliability Engineer (SRE). 
+Analyze the following error details.
 
-                    if (localCode) {
-                        // Regex se AI ka likha hua exact naya code nikalna
-                        const codeMatch = rcaText.match(/```typescript\n([\s\S]*?)```/);
-                        
-                        if (codeMatch && codeMatch[1]) {
-                            const newFileContent = codeMatch[1];
-                            const branchName = `auto-fix/${errorEvent.serviceName}-${Date.now()}`;
-                            
-                            console.log(`\n🛠️ [GITOPS] Auto-Healing Initiated for ${localCode.filePath}...`);
-                            
-                            try {
-                                // 1. Overwrite the file with AI's fix
-                                fs.writeFileSync(localCode.filePath, newFileContent);
-                                console.log(`✏️ Source code successfully rewritten.`);
+CURRENT INCIDENT:
+Service Name: ${errorEvent.serviceName}
+Error Message: ${errorEvent.errorDetails.message}
 
-                                // 2. Git Branch & Commit
-                                await git.checkoutLocalBranch(branchName);
-                                await git.add(localCode.filePath);
-                                await git.commit(`fix(${errorEvent.serviceName}): Auto-healed missing amount bug\n\nAI RCA: ${errorEvent.errorDetails.message}`);
-                                
-                                console.log(`🌿 Git branch '${branchName}' created & committed!`);
-                                console.log(`🚀 ACTION REQUIRED: Run 'git push origin ${branchName}' to open a Pull Request.\n`);
-                                
-                                // Agent ko wapas main branch pe laana (taaki dev environment disturb na ho)
-                                await git.checkout('main'); 
-                                await sendDiscordAlert(errorEvent.serviceName, errorEvent.errorDetails.message, rcaText, branchName);
+${codeBlock}
 
-                            } catch (gitError) {
-                                console.error("❌ [GITOPS] Failed to apply git commit:", gitError);
-                            }
-                        }
-                    }
+Format your response in plain text with two headings: 
+1. Root Cause
+2. Code Fix 
+CRITICAL: Under "Code Fix", provide ONLY the updated version of the provided 30-line code snippet wrapped in \`\`\`typescript ... \`\`\`. Do NOT provide the entire file. We will replace the old snippet with your new snippet.
+`;
+
+const result = await aiModel.generateContent(prompt);
+const rcaText = result.response.text();
+
+console.log("\n💡 [AI ROOT CAUSE ANALYSIS] 💡");
+console.log("=================================================\n");
+
+if (localCode) {
+    const codeMatch = rcaText.match(/```typescript\n([\s\S]*?)```/);
+    
+    if (codeMatch && codeMatch[1]) {
+        const newSnippetContent = codeMatch[1].trim();
+        const branchName = `auto-fix/${errorEvent.serviceName}-${Date.now()}`;
+        
+        console.log(`\n🛠️ [GITOPS] Auto-Healing Initiated for ${localCode.filePath}...`);
+        
+        try {
+            // 1. Sirf purane snippet ko naye snippet se replace karo (Baaki file safe rahegi)
+            const newFileContent = localCode.fullContent.replace(localCode.snippet, newSnippetContent);
+            fs.writeFileSync(localCode.filePath, newFileContent);
+            console.log(`✏️ Source code successfully patched.`);
+
+            // 2. Git Branch, Commit, aur Push
+            await git.checkoutLocalBranch(branchName);
+            await git.add(localCode.filePath);
+            await git.commit(`fix(${errorEvent.serviceName}): Auto-healed bug\n\nAI RCA: ${errorEvent.errorDetails.message}`);
+            
+            console.log(`🌿 Git branch '${branchName}' created & committed!`);
+            
+            // Automatically push to remote
+            await git.push('origin', branchName);
+            console.log(`☁️ Code pushed to remote repository.`);
+
+            // 3. GitHub PR Create karna
+            await createPullRequest(branchName, errorEvent.serviceName, errorEvent.errorDetails.message, rcaText);
+            
+            // Agent ko wapas main branch pe laana
+            await git.checkout('main'); 
+            await sendDiscordAlert(errorEvent.serviceName, errorEvent.errorDetails.message, rcaText, branchName);
+
+        } catch (gitError) {
+            console.error("❌ [GITOPS] Failed to apply git commit or push:", gitError);
+        }
+    }
+}
 
                     // STEP C: Save back to Vector DB
                     console.log("💾 Memorizing this RCA to Vector Database...");
@@ -260,3 +333,27 @@ const startAgent = async () => {
 };
 
 startAgent();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

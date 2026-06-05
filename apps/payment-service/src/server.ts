@@ -18,9 +18,7 @@ app.post('/api/v1/payments/process', async (req: Request, res: Response) => {
     try {
         const { orderId, paymentMethod } = req.body;
         
-        // ✅ FIX: Removed the hardcoded Chaos Test error that was causing the service failure.
-        // In a real production environment, you would integrate with the Stripe SDK here.
-        // Example: const charge = await stripe.charges.create({...});
+        
         
         console.log(`Processing payment for Order: ${orderId} using ${paymentMethod}`);
 
